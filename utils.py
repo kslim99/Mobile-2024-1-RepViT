@@ -234,3 +234,22 @@ def replace_batchnorm(net):
             setattr(net, child_name, torch.nn.Identity())
         else:
             replace_batchnorm(child)
+
+def profile_num_parameters(model):
+    num_parameters = dict()
+    params = []
+    for name, param in model.named_parameters():
+        if param.dim() > 1:
+            num_parameters[name] = param.numel()
+    
+    for key, value in num_parameters.items():
+        print('layer:', key, "\t num_parameters:", value)
+        params.append(value)
+    
+    return params
+
+def calibrate(model, data_loader):
+    model.eval()
+    with torch.no_grad():
+        for image, target in data_loader:
+            model(image)

@@ -4,6 +4,7 @@ import numpy as np
 import time
 import torch
 import torch.backends.cudnn as cudnn
+# import torch_tensorrt
 import json
 import os
 
@@ -19,7 +20,7 @@ from timm.utils import NativeScaler, get_state_dict, ModelEma
 from data.samplers import RASampler
 from data.datasets import build_dataset
 from data.threeaugment import new_data_aug_generator
-from engine import train_one_epoch, evaluate
+from engine import train_one_epoch, evaluate, sensitivity_scan
 from losses import DistillationLoss
 
 import model
@@ -181,6 +182,11 @@ def get_args_parser():
                         help='url used to set up distributed training')
     parser.add_argument('--save_freq', default=1, type=int,
                         help='frequency of model saving')
+
+    # LKS: PTQ & pruning parameters
+    parser.add_argument('--quantize', action='store_true', default=False)
+    parser.add_argument('--prune', action='store_true', default=False)
+    # modification end
     
     parser.add_argument('--deploy', action='store_true', default=False)
     parser.add_argument('--project', default='repvit', type=str)
@@ -246,14 +252,36 @@ def main(args):
 
     if args.ThreeAugment:
         data_loader_train.dataset.transform = new_data_aug_generator(args)
-        
-    data_loader_val = torch.utils.data.DataLoader(
+
+    data_loader_val = None
+    if args.quantize:
+        data_loader_val = torch.utils.data.DataLoader(
         dataset_val, sampler=sampler_val,
         batch_size=int(1.5 * args.batch_size),
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
-        drop_last=False
+        drop_last=True
     )
+    else:    
+        data_loader_val = torch.utils.data.DataLoader(
+            dataset_val, sampler=sampler_val,
+            batch_size=int(1.5 * args.batch_size),
+            num_workers=args.num_workers,
+            pin_memory=args.pin_mem,
+            drop_last=False
+        )
+
+    """
+    calibrator = None
+    if args.quantize:
+        calibrator = torch_tensorrt.ptq.DataLoaderCalibrator(
+            data_loader_val,
+            cache_file='./calibration.cache',
+            use_cache=False,
+            algo_type=torch_tensorrt.ptq.CalibrationAlgo.ENTROPY_CALIBRATION_2,
+            device=device,
+        )
+    """
 
     mixup_fn = None
     mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
@@ -383,12 +411,39 @@ def main(args):
             if 'scaler' in checkpoint:
                 loss_scaler.load_state_dict(checkpoint['scaler'])
     if args.eval:
-        utils.replace_batchnorm(model) # Users may choose whether to merge Conv-BN layers during eval
-        print(f"Evaluating model: {args.model}")
-        test_stats = evaluate(data_loader_val, model, device)
-        print(
-            f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-        return
+        # params = utils.profile_num_parameters(model)
+        # print(params)
+        # sensitivity_scan(model, data_loader_val, device)
+        if args.prune:
+            pass
+        if args.quantize:
+            utils.replace_batchnorm(model) # Users may choose whether to merge Conv-BN layers during eval
+            print("Creating quantized model")
+            quant_model = torch.ao.quantization.quantize_dynamic(
+                model, {torch.nn.Conv2d, torch.nn.BatchNorm1d, torch.nn.BatchNorm2d},
+                dtype=torch.qint8
+            )
+            """
+            quant_model = torch_tensorrt.compile(
+                model,
+                inputs=[torch_tensorrt.Input((int(1.5 * args.batch_size), 3, args.input_size, args.input_size))], 
+                enabled_precisions={torch.float, torch.int8},
+                calibrator=calibrator
+            )
+            """
+            quant_model.to(device)
+            print(f"Evaluating model: {args.model}-quantized")
+            test_stats = evaluate(data_loader_val, quant_model, device)
+            print(
+                f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+            return
+        else:    
+            utils.replace_batchnorm(model) # Users may choose whether to merge Conv-BN layers during eval
+            print(f"Evaluating model: {args.model}")
+            test_stats = evaluate(data_loader_val, model, device)
+            print(
+                f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+            return
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()

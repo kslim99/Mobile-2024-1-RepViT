@@ -12,6 +12,10 @@ from timm.utils import accuracy, ModelEma
 
 from losses import DistillationLoss
 import utils
+import numpy as np
+from tqdm.auto import tqdm
+import copy
+import torch.nn.utils.prune as prune
 
 def set_bn_state(model):
     for m in model.modules():
@@ -104,3 +108,62 @@ def evaluate(data_loader, model, device):
           .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+@torch.no_grad()
+def evaluate_silent(data_loader, model, device):
+    criterion = torch.nn.CrossEntropyLoss()
+
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    header = 'Test:'
+
+    # switch to evaluation mode
+    model.eval()
+
+    for images, target in data_loader:
+        images = images.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
+
+        # compute output
+        with torch.cuda.amp.autocast():
+            output = model(images)
+            loss = criterion(output, target)
+
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+
+        batch_size = images.shape[0]
+        metric_logger.update(loss=loss.item())
+        metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
+        metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+    # gather the stats from all processes
+    metric_logger.synchronize_between_processes()
+    """
+    print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
+          .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
+    """
+
+    return metric_logger.acc1.global_avg
+
+@torch.no_grad()
+def sensitivity_scan(model, dataloader, device, scan_step=0.1, scan_start=0.1, scan_end=0.5, verbose=True):
+    sparsities = np.arange(start=scan_start, stop=scan_end, step=scan_step)
+    accuracies = []  
+    named_conv_modules = [(name, module) for (name, module) \
+                          in model.named_modules() \
+                          if isinstance(module, torch.nn.Conv2d) or isinstance(module, torch.nn.Linear) ]
+    for i_layer, (name, module) in enumerate(named_conv_modules):
+        module_clone = copy.deepcopy(module)
+        accuracy = []
+        for sparsity in tqdm(sparsities, desc=f'scanning {i_layer}/{len(named_conv_modules)} weight - {name}'):
+            prune.ln_structured(module, name='weight', n=2, dim=1, amount=sparsity)
+            prune.remove(module, 'weight')
+            acc = evaluate_silent(dataloader, model, device)
+            if verbose:
+                print(f'\r    sparsity={sparsity:.2f}: accuracy={acc:.2f}%', end='')
+            # restore
+            module = copy.deepcopy(module_clone)
+            # print(list(module.named_parameters()))
+            accuracy.append(acc)
+        if verbose:
+            print(f'sparsity=[{",".join(["{:.2f}".format(x) for x in sparsities])}]: accuracy=[{", ".join(["{:.2f}%".format(x) for x in accuracy])}]', end='')
+        accuracies.append(accuracy)
+    return sparsities, accuracies
